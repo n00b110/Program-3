@@ -1,0 +1,117 @@
+#lang racket
+
+;; Data definitions
+(struct account (number name balance) #:transparent)
+(struct purchase (timestamp merchant amount) #:transparent)
+(struct payment (timestamp type details amount) #:transparent)
+  ;; type is one of: 'cash 'check 'credit 'debit
+  ;; details is check-number for 'check, card-number for 'credit/'debit
+
+;; Read accounts data from ACCOUNTS.TXT
+(define (read-accounts file)
+  (map (lambda (line)
+         (apply account
+                (map (lambda (x) (if (string? x) x (string->number x)))
+                     (string-split line))))
+       (file->lines file)))
+
+;; Read transactions data from TRANSACTIONS.TXT
+(define (read-transactions file)
+  (map (lambda (line)
+         (let ([parts (string-split line)])
+           (case (string->symbol (list-ref parts 0))
+             ['Purchase (apply purchase
+                               (cons (string->number (list-ref parts 2))
+                                     (list (list-ref parts 3)
+                                           (string->number (list-ref parts 4)))))]
+             ['Payment (apply payment
+                              (cons (string->number (list-ref parts 2))
+                                    (cons (string->symbol (list-ref parts 3))
+                                          (list (if (member (list-ref parts 3) '("cash" "check"))
+                                                    (string->number (list-ref parts 4))
+                                                    (list-ref parts 4))
+                                                (string->number (list-ref parts 5))))))]))
+       (file->lines file)))
+
+;; Group transactions by account number
+(define (group-by-account txns)
+  (foldl (lambda (txn acc)
+           (hash-set acc
+                     (if (purchase? txn) (purchase-timestamp txn) (payment-timestamp txn))
+                     (hash-set (hash-ref acc
+                                         (if (purchase? txn) (purchase-timestamp txn) (payment-timestamp txn))
+                                         (make-immutable-hash (list (cons 'purchases '())
+                                                                     (cons 'payments '()))))
+                               (if (purchase? txn) 'purchases 'payments)
+                               (cons txn (hash-ref (hash-ref acc
+                                                             (if (purchase? txn) (purchase-timestamp txn) (payment-timestamp txn)))
+                                                   (if (purchase? txn) 'purchases 'payments))))))
+         (make-immutable-hash)
+         txns))
+
+;; Assign transaction numbers
+(define (assign-transaction-numbers txns-by-account)
+  (for/hash ([txns (in-hash-values txns-by-account)]
+             #:iter-val #t)
+    (values (hash-ref txns 'purchases)
+            (hash-ref txns 'payments))))
+
+;; Process transactions for an account
+(define (process-transactions account txns-by-account)
+  (foldl (lambda (txn acc)
+           (cond [(purchase? txn) (account (account-number acc)
+                                           (account-name acc)
+                                           (+ (account-balance acc) (purchase-amount txn)))]
+                 [(payment? txn)
+                  (let ([amount (payment-amount txn)])
+                    (account (account-number acc)
+                             (account-name acc)
+                             (- (account-balance acc) amount)))]))
+         account
+         (append (hash-ref txns-by-account 'purchases)
+                 (hash-ref txns-by-account 'payments))))
+
+;; Generate statement for an account                  
+(define (generate-statement account txns-by-account)
+  (define purchases (hash-ref txns-by-account 'purchases))
+  (define payments (hash-ref txns-by-account 'payments))
+  (define total-purchases (foldl (lambda (p acc) (+ acc (purchase-amount p))) 0 purchases))
+  (define total-payments (foldl (lambda (p acc) (+ acc (payment-amount p))) 0 payments))
+  (define ending-balance (+ (account-balance account) total-purchases (- total-payments)))
+  (string-append (format "Account: ~a \"~a\"\nStarting Balance: ~a\n\n" 
+                         (account-number account)
+                         (account-name account) 
+                         (account-balance account))
+                 (apply string-append
+                        (map (lambda (txn)
+                               (if (purchase? txn)
+                                   (format "~a Purchase ~a ~a\n"
+                                           (purchase-timestamp txn)
+                                           (substring (purchase-merchant txn) 0 
+                                                       (min 40 (string-length (purchase-merchant txn))))
+                                           (purchase-amount txn))
+                                   (format "~a Payment ~a ~a\n" 
+                                           (payment-timestamp txn)
+                                           (case (payment-type txn)
+                                             ['cash "Cash"]
+                                             ['check "Check"] 
+                                             ['credit "Credit"]
+                                             ['debit "Debit"])
+                                           (payment-amount txn))))
+                             (append purchases payments)))
+                 (format "\nTotal Purchases: ~a\nTotal Payments: ~a\nEnding Balance: ~a\n\n"
+                         total-purchases total-payments ending-balance)))
+                              
+;; Main
+(define accounts (read-accounts "ACCOUNTS.TXT"))
+(define transactions (read-transactions "TRANSACTIONS.TXT"))
+(define txns-by-account (assign-transaction-numbers (group-by-account transactions)))
+(define processed-accounts (map (lambda (account) 
+                                   (process-transactions account (hash-ref txns-by-account (account-number account))))
+                                 accounts))
+(define statements (map generate-statement processed-accounts txns-by-account))
+(with-output-to-file "STATEMENTS.TXT"
+  (lambda ()
+    (for ([stmt statements])
+      (display stmt)))
+  #:exists 'replace)
